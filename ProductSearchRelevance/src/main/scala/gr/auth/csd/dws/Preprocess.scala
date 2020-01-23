@@ -24,11 +24,14 @@ object Preprocess {
   def stemming(dataFrame: DataFrame):DataFrame = {
     val df_with_stemmed_title = titleStemming(dataFrame)
     val df_with_stemmed_descriptions = descriptionStemming(df_with_stemmed_title)
-    val df_with_stemmed_attributes = attributeStemming(df_with_stemmed_descriptions)
+//    val df_with_stemmed_attributes = attributeStemming(df_with_stemmed_descriptions)
+    val df_with_stemmed_search_terms = searchTermStemming(df_with_stemmed_descriptions)
+
+//    dropUnneededColumns
 
 //    searchQuerySpellCorrector()
 
-    df_with_stemmed_attributes
+    df_with_stemmed_search_terms
   }
 
 
@@ -47,7 +50,15 @@ object Preprocess {
     df_with_stemmed_value
   }
 
+  private def searchTermStemming(dataFrame: DataFrame):DataFrame = {
+    stemming(dataFrame, "search_term", "stemmed_search_term")
+  }
+
 //  private def searchQuerySpellCorrector(dataFrame: DataFrame):DataFrame = {
+//
+//  }
+
+//  private def dropUnneededColumns(dataFrame: DataFrame):DataFrame = {
 //
 //  }
 

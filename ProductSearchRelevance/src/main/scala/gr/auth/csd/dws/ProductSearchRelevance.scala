@@ -23,9 +23,8 @@ object ProductSearchRelevance {
     log("CSVs to merged DF")
     var df = IOUtils.parseAndJoinCSVs(spark)
 
-    log("Saving merged dataframe parquet...")
-    df.write.parquet("resources/merged_CSVs.df")
-
+//    log("Saving merged dataframe parquet...")
+//    df.write.parquet("resources/merged_CSVs.df")
 //    log("Loading merged dataframe parquet...")
 //    var df = spark.read.parquet("resources/merged_CSVs.df")
 //    df.show(10)
@@ -33,7 +32,7 @@ object ProductSearchRelevance {
 
     //Data sampling
     log("Initial DataFrame size: " + df.count())
-    df = df.sample(0.001, 323)
+    df = df.sample(0.1, 323)
     log("Sample size: " + df.count())
     df.describe().show()
 

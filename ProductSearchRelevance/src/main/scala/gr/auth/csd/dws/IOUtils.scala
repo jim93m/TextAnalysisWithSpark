@@ -22,19 +22,22 @@ object IOUtils {
       */
     val trainDF = csvToDataframe(spark, "train.csv", logging = true)
     val productDescriptionsDF = csvToDataframe(spark, "product_descriptions.csv", logging = true)
-    val attributesDF = csvToDataframe(spark, "attributes.csv", logging = true)
+//    val attributesDF = csvToDataframe(spark, "attributes.csv", logging = true)
 
     log("Merging Dataframes...")
 
     val tmp_df = trainDF.join(productDescriptionsDF, usingColumns = Seq("product_uid"), joinType = "left")
-    val merged_df = tmp_df.join(attributesDF, usingColumns = Seq("product_uid"), joinType = "left")
+//    val merged_df = tmp_df.join(attributesDF, usingColumns = Seq("product_uid"), joinType = "left")
 
-    println(merged_df.show(10))
-    merged_df.printSchema()
+//    println(merged_df.show(10))
+//    merged_df.printSchema()
+    println(tmp_df.show(10))
+    tmp_df.printSchema()
     //df.describe().show()
 
     log("Merged DataFrames!")
-    merged_df
+//    merged_df
+    tmp_df
   }
 
   private def csvToDataframe(spark:SparkSession, filename:String, logging:Boolean):DataFrame = {
