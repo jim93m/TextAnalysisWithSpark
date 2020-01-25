@@ -1,10 +1,13 @@
 package gr.auth.csd.dws
 
-import org.apache.spark.ml.feature.{HashingTF, IDF, Tokenizer}
-import org.apache.spark.sql.{Column, DataFrame, SparkSession}
+import org.apache.spark.ml.feature.{HashingTF, IDF, Tokenizer, VectorAssembler}
+import org.apache.spark.mllib.linalg.SparseVector
+import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.functions._
 import gr.auth.csd.dws.IOUtils.log
+import org.apache.spark.mllib.linalg.distributed.{IndexedRow, IndexedRowMatrix, MatrixEntry}
+import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
 
 object FeatureFactory {
@@ -44,21 +47,53 @@ object FeatureFactory {
     *
     */
   def generateFeatures(spark: SparkSession, df:DataFrame):DataFrame = {
+    // For implicit conversions like converting RDDs to DataFrames
+    import spark.implicits._
+
     val df_with_cosine_distance = FeatureFactory.cosine_distance(spark, df)
     val df_with_tf_idf = FeatureFactory.tf_idf(spark, df_with_cosine_distance)
-    val df_with_len_of_query = FeatureFactory.len_of_query(df_with_tf_idf)
-    val df_with_lev_dist_prod_desc = FeatureFactory.levenshtein_distance(df_with_len_of_query, col("stemmed_product_description"), col("stemmed_search_term"), "levenshtein_dist_description")
+
+    log("Calculating Levenshtein Distances...")
+    val df_with_lev_dist_prod_desc = FeatureFactory.levenshtein_distance(df_with_tf_idf, col("stemmed_product_description"), col("stemmed_search_term"), "levenshtein_dist_description")
     val df_with_lev_dist_prod_title = FeatureFactory.levenshtein_distance(df_with_lev_dist_prod_desc, col("stemmed_product_title"), col("stemmed_search_term"), "levenshtein_dist_title")
-//    val df_with_lev_dist_attr = FeatureFactory.levenshtein_distance(df_with_lev_dist_prod_title, col("value"), col("stemmed_search_term"), "levenshtein_dist_attr")
+    val df_with_lev_dist_attr = FeatureFactory.levenshtein_distance(df_with_lev_dist_prod_title, col("stemmed_attributes"), col("stemmed_search_term"), "levenshtein_dist_attr")
 
+    log("Calculating length of each search term, length of attributes, number of attributes per product...")
+    val df_with_len_of_query = FeatureFactory.len_of_query(df_with_lev_dist_attr)
+    val df_with_len_of_attr= FeatureFactory.len_of_attributes(df_with_len_of_query)
+    val df_with_num_of_attr= FeatureFactory.num_of_attributes(df_with_len_of_attr)
 
-    df_with_lev_dist_prod_title
+    log("Calculating words in common...")
+    val df_with_commonWords_term_title = FeatureFactory.common_words(spark, df_with_num_of_attr, $"stemmed_search_term", $"stemmed_product_title", "commonWords_term_title")
+    val df_with_commonWords_term_description = FeatureFactory.common_words(spark, df_with_commonWords_term_title, $"stemmed_search_term", $"stemmed_product_description", "commonWords_term_description")
+    val df_with_commonWords_term_attr = FeatureFactory.common_words(spark, df_with_commonWords_term_description, $"stemmed_search_term", $"stemmed_attributes", "commonWords_term_attr")
+
+    log("Calculating ratio of words in common...")
+    val df_with_ratio_of_commonWords_term_title = FeatureFactory.ratio_of_common_words(df_with_commonWords_term_attr, $"commonWords_term_title", $"len_of_query", "ratio_title")
+    val df_with_ratio_of_commonWords_term_desc = FeatureFactory.ratio_of_common_words(df_with_ratio_of_commonWords_term_title, $"commonWords_term_description", $"len_of_query", "ratio_description")
+    val df_with_ratio_of_commonWords_term_attr = FeatureFactory.ratio_of_common_words(df_with_ratio_of_commonWords_term_desc, $"commonWords_term_attr", $"len_of_query", "ratio_attr")
+
+    df_with_ratio_of_commonWords_term_attr
   }
 
-  private def cosine_distance(spark:SparkSession, df:DataFrame):DataFrame = {
+  private def cosine_distance(spark:SparkSession, dataFrame:DataFrame):DataFrame = {
 
-    df
+
+    dataFrame
   }
+
+//  def cosineSimilarity(vectorA: SparseVector, vectorB:SparseVector,normASqrt:Double,normBSqrt:Double) :(Double,Double) = {
+//    var dotProduct = 0.0
+//    for (i <-  vectorA.indices){
+//      dotProduct += vectorA(i) * vectorB(i)
+//    }
+//    val div = (normASqrt * normBSqrt)
+//    if( div == 0 )
+//      (dotProduct,0)
+//    else
+//      (dotProduct,dotProduct / div)
+//  }
+
 
   private def tf_idf(spark:SparkSession, df:DataFrame):DataFrame = {
     val tokenizer = new Tokenizer().setInputCol("stemmed_product_description").setOutputCol("product_description_words")
@@ -87,101 +122,54 @@ object FeatureFactory {
     * 'search_term' length
     */
   private def len_of_query(dataFrame: DataFrame):DataFrame = {
-    dataFrame.withColumn("len_of_query", searchTermLength(col("search_term")))
+    val searchTermLength = udf((searchTerm: String) => searchTerm.length())
+    dataFrame.withColumn("len_of_query", searchTermLength(col("stemmed_search_term")))
   }
-  private val searchTermLength = udf((searchTerm: String) => searchTerm.length())
 
   /**
-    * # New Feature: Length of the product brand string (if it occurs)
-    * df_all['len_of_brand'] = df_all['brand'].map(lambda x:len(str(x).split())).astype(np.int64)
+    * 'attributes' length
     */
+  private def len_of_attributes(dataFrame: DataFrame):DataFrame = {
+    val attributesLength = udf((attributes: String) =>
+      if (attributes == null || attributes.isEmpty) {
+        0
+      } else {
+        attributes.length()
+      }
+    )
+    dataFrame.withColumn("len_of_attr", attributesLength(col("stemmed_attributes")))
+  }
 
   /**
-    *
-    * # New Feature: Length of attribute string for each product instance
-    * df_all['len_of_attribute'] = df_all['attribute'].map(lambda x:len(str(x).split())).astype(np.int64)
+    * number of 'attributes'
     */
+  private def num_of_attributes(dataFrame: DataFrame):DataFrame = {
+    val numOfAttributes = udf((attributes: String) =>
+      if (attributes == null || attributes.isEmpty) {
+        0
+      } else {
+        attributes.split("\0").length
+      }
+    )
+    dataFrame.withColumn("num_of_attr", numOfAttributes(col("stemmed_attributes")))
+  }
 
-  /**
-    *
-    * # Internal Feature: Product Info. This collects the related search term, title, description, and product attributes.
-    * # Note that this is obviously not used in the model given that it is a string.
-    * # Rather, this is used in subsequent calculations.
-    * df_all['product_info'] = df_all['search_term']+'\t'+df_all['product_title']+'\t'+df_all['product_description']+'\t'+df_all['attribute']
-    */
+  private def common_words(spark: SparkSession, dataFrame: DataFrame, column1: Column, column2: Column, newColumnName: String):DataFrame = {
+    val common_terms = udf((a: String, b: String) =>
+      if (a == null || b == null || a.isEmpty || b.isEmpty) {
+        0
+      } else {
+        var tmp1 = a.split(" ")
+        var tmp2 = b.split(" ")
+        tmp1.intersect(tmp2).length
+      }
+    )
 
-  /**
-    *
-    * # New Feature: Number of words which occur in both the query and in the product's title
-    * df_all['word_in_title'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0],str(x).split('\t')[1]))
-    */
+    dataFrame.withColumn(newColumnName, common_terms(column1, column2))
+  }
 
-  /**
-    *
-    * # New Feature: Number of words which occur in both the query and in the product's description.
-    * # Again, product_info = product_title + product_description + attribute
-    * df_all['word_in_description'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0],str(x).split('\t')[2]))
-    */
-
-  /**
-    *
-    * # New Feature: Number of words which occur in both the query and in the product's attributes.
-    * df_all['word_in_attributes'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0],str(x).split('\t')[3]))
-    */
-
-  /**
-    *
-    * # New Feature: Number of words which occur in both the query and in the product's brand (if defined)
-    * df_all['attr'] = str(df_all['search_term'])+"\t"+str(df_all['brand'])
-    * df_all['brand_in_search'] = df_all['attr'].map(lambda x:str_common_word(str(x).split('\t')[0],str(x).split('\t')[1]))
-    */
-
-  /**
-    *
-    * # New Feature: Ratio of terms which are common between the brand and query, and the overall length of the brand string
-    * df_all['ratio_brand'] = df_all['brand_in_search']/df_all['len_of_brand']
-    */
-
-  /**
-    *
-    * # New Feature: Ratio of terms which are common in the title and the overall length of the query string
-    * df_all['ratio_title'] = df_all['word_in_title']/df_all['len_of_query']
-    */
-
-  /**
-    *
-    * # New Feature: Ratio of terms which are common in the description and the overall length of the query string
-    * df_all['ratio_description'] = df_all['word_in_description']/df_all['len_of_query']
-    */
-
-  /**
-    *
-    * # New Feature: Ratio of terms which are common in the attributes and the overall length of the query string
-    * df_all['ratio_attributes'] = df_all['word_in_attributes']/df_all['len_of_query']
-    */
-
-  /**
-    *
-    * # New Feature: The last word which matched between the title and the query
-    * df_all['last_word_title_match'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0].split(" ")[-1],str(x).split('\t')[1]))
-    */
-
-  /**
-    *
-    * # New Feature: The last word which matched between the description and the query
-    * df_all['last_word_description_match'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0].split(" ")[-1],str(x).split('\t')[2]))
-    */
-
-  /**
-    *
-    * # New Feature: The first word which matched between the title and the query
-    * df_all['first_word_title_match'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0].split(" ")[0],str(x).split('\t')[1]))
-    */
-
-  /**
-    *
-    * # New Feature: The first word which matched between the description and the query
-    * df_all['first_word_description_match'] = df_all['product_info'].map(lambda x:str_common_word(str(x).split('\t')[0].split(" ")[0],x.split('\t')[2]))
-    */
-
+  private def ratio_of_common_words(dataFrame: DataFrame, commonTermsCol: Column, allTermsCol: Column, newColumnName: String):DataFrame = {
+    val ratio_of_common_terms = udf((commonTerms: Float, allTerms: Int) => commonTerms/allTerms)
+    dataFrame.withColumn(newColumnName, ratio_of_common_terms(commonTermsCol, allTermsCol))
+  }
 }

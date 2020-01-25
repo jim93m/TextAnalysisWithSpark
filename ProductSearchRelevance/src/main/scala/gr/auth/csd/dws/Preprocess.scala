@@ -1,13 +1,21 @@
 package gr.auth.csd.dws
 
-import org.apache.spark.sql.DataFrame
+import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.mllib.feature.Stemmer
+import org.apache.spark.sql.functions._
 
 import gr.auth.csd.dws.IOUtils.log
 
 
 
 object Preprocess {
+
+  def run(spark: SparkSession, dataFrame: DataFrame, logging: Boolean):DataFrame = {
+    val lowerDF = toLowerCase(spark, dataFrame)
+    val stemmedDF = stemming(lowerDF, logging=logging)
+
+    stemmedDF
+  }
 
   /**
     * @param spark the spark session
@@ -21,13 +29,11 @@ object Preprocess {
     *
     * @return pre-processed (stemmed with Snowball Stemmer) dataframe
     */
-  def stemming(dataFrame: DataFrame):DataFrame = {
-    val df_with_stemmed_title = titleStemming(dataFrame)
-    val df_with_stemmed_descriptions = descriptionStemming(df_with_stemmed_title)
-//    val df_with_stemmed_attributes = attributeStemming(df_with_stemmed_descriptions)
-    val df_with_stemmed_search_terms = searchTermStemming(df_with_stemmed_descriptions)
-
-//    dropUnneededColumns
+  private def stemming(dataFrame: DataFrame, logging: Boolean):DataFrame = {
+    val df_with_stemmed_title = titleStemming(dataFrame, logging=logging)
+    val df_with_stemmed_descriptions = descriptionStemming(df_with_stemmed_title, logging=logging)
+    val df_with_stemmed_attributes = attributeStemming(df_with_stemmed_descriptions, logging=logging)
+    val df_with_stemmed_search_terms = searchTermStemming(df_with_stemmed_attributes, logging=logging)
 
 //    searchQuerySpellCorrector()
 
@@ -35,42 +41,78 @@ object Preprocess {
   }
 
 
-  private def titleStemming(dataFrame: DataFrame):DataFrame = {
-    stemming(dataFrame, "product_title", "stemmed_product_title")
+  private def titleStemming(dataFrame: DataFrame, logging: Boolean):DataFrame = {
+    stemming(dataFrame, "product_title", "stemmed_product_title", logging=logging)
   }
 
-  private def descriptionStemming(dataFrame: DataFrame):DataFrame = {
-    stemming(dataFrame, "product_description", "stemmed_product_description")
+  private def descriptionStemming(dataFrame: DataFrame, logging: Boolean):DataFrame = {
+    stemming(dataFrame, "product_description", "stemmed_product_description", logging=logging)
   }
 
-  private def attributeStemming(dataFrame: DataFrame):DataFrame = {
-    val df_with_stemmed_name = stemming(dataFrame, "name", "stemmed_name")
-    val df_with_stemmed_value = stemming(df_with_stemmed_name, "value", "stemmed_value")
-
-    df_with_stemmed_value
+  private def attributeStemming(dataFrame: DataFrame, logging: Boolean):DataFrame = {
+    stemming(dataFrame, "attributes", "stemmed_attributes", logging=logging)
   }
 
-  private def searchTermStemming(dataFrame: DataFrame):DataFrame = {
-    stemming(dataFrame, "search_term", "stemmed_search_term")
+  private def searchTermStemming(dataFrame: DataFrame, logging: Boolean):DataFrame = {
+    stemming(dataFrame, "search_term", "stemmed_search_term", logging=logging)
   }
 
 //  private def searchQuerySpellCorrector(dataFrame: DataFrame):DataFrame = {
 //
 //  }
 
-//  private def dropUnneededColumns(dataFrame: DataFrame):DataFrame = {
-//
-//  }
+  private def toLowerCase(spark: SparkSession, dataFrame: DataFrame):DataFrame = {
+    // For implicit conversions like converting RDDs to DataFrames
+    import spark.implicits._
+    log("Converting text-columns to lowercase...")
+    dataFrame.select($"product_uid",
+                      $"id",
+                      lower($"product_title").alias("product_title"),
+                      lower($"search_term").alias("search_term"),
+                      $"relevance",
+                      lower($"product_description").alias("product_description"),
+                      lower($"attributes").alias("attributes"))
+  }
+
+  def dropUnneededColumns(spark: SparkSession, dataFrame: DataFrame):DataFrame = {
+    // For implicit conversions like converting RDDs to DataFrames
+    import spark.implicits._
+
+    log("Dropping unneeded colmns (product_title, product_description, attributes, search_term)")
+    dataFrame.drop($"product_title")
+             .drop($"product_description")
+             .drop($"attributes")
+             .drop($"search_term")
+  }
+
+  def renameColumns(dataFrame: DataFrame):DataFrame = {
+    log("Renaming unneeded columns: ")
+    log(">> stemmed_product_title        - to -   title")
+    log(">> stemmed_product_description  - to -   description")
+    log(">> stemmed_attributes           - to -   attributes")
+    log(">> stemmed_search_term          - to -   search_term")
+
+    dataFrame.withColumnRenamed("stemmed_product_title", "title")
+             .withColumnRenamed("stemmed_product_description", "description")
+             .withColumnRenamed("stemmed_attributes", "attributes")
+             .withColumnRenamed("stemmed_search_term", "search_term")
+  }
+
+  //  private def removeStopwords(dataFrame: DataFrame):DataFrame = {
+  //
+  //  }
 
 
-  private def stemming(dataFrame: DataFrame, inputCol:String, outputCol:String):DataFrame = {
+  private def stemming(dataFrame: DataFrame, inputCol:String, outputCol:String, logging: Boolean):DataFrame = {
     val stemmed = new Stemmer().setInputCol(inputCol)
       .setOutputCol(outputCol)
       .setLanguage("English")
       .transform(dataFrame)
 
     log("Stemming '" + inputCol + "' into '" + outputCol + "'")
-    stemmed.show(10)
+    if (logging) {
+      stemmed.show(10, truncate = 80)
+    }
 
     stemmed
   }
