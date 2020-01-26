@@ -10,10 +10,12 @@ import org.apache.spark.ml.evaluation.RegressionEvaluator
 import org.apache.spark.ml.feature.VectorAssembler
 import org.apache.spark.ml.regression.{GBTRegressor, LinearRegression, RandomForestRegressor}
 import org.apache.spark.ml.tuning.{ParamGridBuilder, TrainValidationSplit}
+import org.apache.spark.mllib.evaluation.BinaryClassificationMetrics
 import org.apache.spark.sql.functions.{col, udf}
 
 
 object ProductSearchRelevance {
+  var binaryThreshold: Double = 2.0
 
   def main(args: Array[String]): Unit = {
     val timeStarted = System.currentTimeMillis()
@@ -106,6 +108,7 @@ object ProductSearchRelevance {
     //val lrModel = lr.fit(training)
     val lrPredictions = lrModel.transform(test)
 
+/*
     // Descritize predictions to certain levels
     // Not currently used, as it did not offer better results
     val roundToLevels = udf((pred: Double) => {
@@ -120,8 +123,7 @@ object ProductSearchRelevance {
     })
     var lrPredictionsRounded = lrPredictions.withColumn("predRound", roundToLevels(col("prediction")))
     lrPredictionsRounded = lrPredictionsRounded.drop(col("prediction")).withColumnRenamed("predRound", "prediction")
-
-
+*/
     println("Validation metric Mean Squared Error (MSE) for Linear Regression models on test data = " + lrModel.validationMetrics.mkString(" "))
     val lr_mse = evaluator.evaluate(lrPredictions)
     //val lr_mse = evaluator.evaluate(lrPredictionsRounded)
@@ -131,16 +133,29 @@ object ProductSearchRelevance {
 
     //Random Forest Regressor
 
-    val rf = new RandomForestRegressor().setLabelCol("label").setFeaturesCol("features")
-    // Train model. This also runs the indexer.
-    val rfModel = rf.fit(training)
-    // Make predictions.
-    val rfPredictions = rfModel.transform(test)
-    // Select example rows to display.
-    rfPredictions.select("prediction", "label", "features").show(10)
+    val rf = new RandomForestRegressor()
 
+    val paramGridRf = new ParamGridBuilder().addGrid(rf.numTrees, Array(10,15,20,25))
+      .addGrid(rf.maxDepth, Array(2,4,6,8,10))
+      .build()
+    val trainValSplitRf = (new TrainValidationSplit()
+      .setEstimator(rf)
+      .setEvaluator(new RegressionEvaluator().setMetricName("mse"))
+      .setEstimatorParamMaps(paramGridRf)
+      .setTrainRatio(0.6))
+
+    val rfModel = trainValSplit.fit(training)
+    //val rfModel = rf.fit(training)
+
+    val rfPredictions = rfModel.transform(test)
+
+    println("Validation metric Mean Squared Error (MSE) for Random Forest Regressor models on test data = " + rfModel.validationMetrics.mkString(" "))
     val rf_mse = evaluator.evaluate(rfPredictions)
     println("Random Forest Regressor Mean Squared Error (MSE) on test data = " + rf_mse)
+
+
+
+
 
     //Gradient-Boosted Tree Regressor
     val gbt = new GBTRegressor().setLabelCol("label").setFeaturesCol("features")
@@ -156,7 +171,7 @@ object ProductSearchRelevance {
     // Descritize predictions into two levels
     val roundTo2Levels = udf((label: Double) => {
       var binary: Double = 0.0
-      if (label > 1.5) {
+      if (label > binaryThreshold) {
         binary = 1.0
       }
       else {
@@ -164,6 +179,8 @@ object ProductSearchRelevance {
       }
       binary
     })
+    //binaryThreshold = output.select(avg($"label")).first().getDouble(0) // Setting the binary threshold for the two clusters
+    println("Binary Threshold: "+ binaryThreshold)
     var outputDisc = output.withColumn("labelRound", roundTo2Levels(col("label")))
     outputDisc.show()
     outputDisc = outputDisc.drop(col("label")).withColumnRenamed("labelRound", "label")
@@ -176,13 +193,51 @@ object ProductSearchRelevance {
     val kmeansPredictions = kmeansModel.transform(outputDisc)
     kmeansPredictions.show(20)
 
+    val kmeansPredictionsAndLabels = kmeansPredictions.select($"prediction",$"label").as[(Double,Double)].rdd
+    val metricsKmeans = new BinaryClassificationMetrics(kmeansPredictionsAndLabels)
+    // F-measure
+    val f1ScoreKmeans = metricsKmeans.fMeasureByThreshold
+    val precisionKmeans = metricsKmeans.precisionByThreshold()
+    val recallKmeans = metricsKmeans.recallByThreshold
+
+    println("F1 Score for Kmeans is: ")
+    f1ScoreKmeans.foreach { case (t, f) =>
+      println(s"Threshold: $t, F-score: $f, Beta = 1")
+    }
+    println("Precision for Kmeans is: ")
+    precisionKmeans.foreach { case (t, p) =>
+      println(s"Threshold: $t, Precision: $p")
+    }
+    println("Recall for Kmeans is: ")
+    recallKmeans.foreach { case (t, r) =>
+      println(s"Threshold: $t, Recall: $r")
+    }
+
 
     //Bisecting k-means
-    val bkm = new BisectingKMeans().setK(2).setSeed(1)
+    val bkm = new BisectingKMeans().setK(2).setSeed(1L)
     val bkmModel = bkm.fit(outputDisc)
     val bkmPredictions = bkmModel.transform(outputDisc)
 
+    val bkmPredictionsAndLabels = bkmPredictions.select($"prediction",$"label").as[(Double,Double)].rdd
+    val metricsBbk = new BinaryClassificationMetrics(bkmPredictionsAndLabels)
+    // F-measure
+    val f1ScoreBbk = metricsBbk.fMeasureByThreshold
+    val precisionBbk = metricsBbk.precisionByThreshold()
+    val recallBbk = metricsBbk.recallByThreshold
 
+    println("F1 Score for Bkm is: ")
+    f1ScoreBbk.foreach { case (t, f) =>
+      println(s"Threshold: $t, F-score: $f, Beta = 1")
+    }
+    println("Precision for Bkm is: ")
+    precisionBbk.foreach { case (t, p) =>
+      println(s"Threshold: $t, Precision: $p")
+    }
+    println("Recall for Bkm is: ")
+    recallBbk.foreach { case (t, r) =>
+      println(s"Threshold: $t, Recall: $r")
+    }
 
 
 
