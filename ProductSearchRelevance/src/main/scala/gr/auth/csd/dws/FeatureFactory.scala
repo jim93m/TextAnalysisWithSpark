@@ -1,12 +1,13 @@
 package gr.auth.csd.dws
 
-import org.apache.spark.ml.feature.{HashingTF, IDF, Tokenizer, VectorAssembler}
+import org.apache.spark.ml.feature._
 import org.apache.spark.mllib.linalg.SparseVector
 import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions.udf
 import org.apache.spark.sql.functions._
 import gr.auth.csd.dws.IOUtils.log
-import org.apache.spark.mllib.linalg.distributed.{IndexedRow, IndexedRowMatrix, MatrixEntry}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.mllib.linalg.distributed.{IndexedRow, IndexedRowMatrix, MatrixEntry, RowMatrix}
 import org.apache.spark.sql.types.{StringType, StructField, StructType}
 
 
@@ -15,46 +16,41 @@ object FeatureFactory {
   /**
     * Features Generation
     *     i. Distances / String similarities
-    *        >> Cosine distance
-    *        >> N-gram overlapping distance
-    *        >> Longest Common Subsequence
-    *        >> Euclidean distance
-    *        >> Jaccard distance
-    *        >> Jaro distance
-    *        >> Smith-Waterman similarity
-    *        >> Fuzzy string distances
-    *        >> Normalized Compression Distance
     *        >> TF-IDF distance
     *        >> Levenshtein distance
+    *        >> Cosine distance
+    *        >> Jaccard distance
     *
     * between:
-    *   >> search term and title using several n-gram segmentations
+    *   >> search term and product title
     *   >> search term and product description
     *   >> search term and transposed attributes
-    *   >> search term and bullets, brand, material, color
     *
     *
     *    ii. Other features
     *        >> Count of each query (frequency) in train/test dataset
-    *        >> Count of POS tags (Nouns, verbs, etc) using the Stanford Part-Of-Speech Tagger http://nlp.stanford.edu/software/tagger.shtml
-    *        >> Count (English) stop words and spelling errors in the query
     *        >> Count number of bullets in attributes (how may attributes)
-    *        >> Brand popularity
-    *        >> 1st-last word similarities to the title
-    *        >> Query-products intra-similarity (i.e. avg and std deviation similarity of the query to all the distinct product it returns) that expresses somehow the ambiguity of the query
     *        >> Count letters histograms for both search query and product title
     *        >> Length of search query, product title, attributes
+    *        >> Common words ratio between search term -vs- title, description and attributes
     *
     */
   def generateFeatures(spark: SparkSession, df:DataFrame):DataFrame = {
     // For implicit conversions like converting RDDs to DataFrames
     import spark.implicits._
 
-    val df_with_cosine_distance = FeatureFactory.cosine_distance(spark, df)
-    val df_with_tf_idf = FeatureFactory.tf_idf(spark, df_with_cosine_distance)
+    log("Calculating TF-IDF (product title, product description, search term)...")
+    val df_with_title_tf_idf = FeatureFactory.title_tf_idf(spark, df)
+    val df_with_desc_tf_idf = FeatureFactory.description_tf_idf(spark, df_with_title_tf_idf)
+    val df_with_term_tf_idf = FeatureFactory.search_term_tf_idf(spark, df_with_desc_tf_idf)
+
+    log("Calculating Similarities (Cosine)...")
+    val df_with_cosine_distance = FeatureFactory.cosine_distance(spark, df_with_term_tf_idf)
+//    val cosine_distance_DF = FeatureFactory.cosine_distance(spark, df_with_term_tf_idf)
+    val jaccard_similarity_DF = FeatureFactory.jaccard_similarity(spark, df_with_term_tf_idf)
 
     log("Calculating Levenshtein Distances...")
-    val df_with_lev_dist_prod_desc = FeatureFactory.levenshtein_distance(df_with_tf_idf, col("stemmed_product_description"), col("stemmed_search_term"), "levenshtein_dist_description")
+    val df_with_lev_dist_prod_desc = FeatureFactory.levenshtein_distance(df_with_cosine_distance, col("stemmed_product_description"), col("stemmed_search_term"), "levenshtein_dist_description")
     val df_with_lev_dist_prod_title = FeatureFactory.levenshtein_distance(df_with_lev_dist_prod_desc, col("stemmed_product_title"), col("stemmed_search_term"), "levenshtein_dist_title")
     val df_with_lev_dist_attr = FeatureFactory.levenshtein_distance(df_with_lev_dist_prod_title, col("stemmed_attributes"), col("stemmed_search_term"), "levenshtein_dist_attr")
 
@@ -77,41 +73,137 @@ object FeatureFactory {
   }
 
   private def cosine_distance(spark:SparkSession, dataFrame:DataFrame):DataFrame = {
+    val normalized_product_title_idf_DF = new Normalizer()
+      .setInputCol("product_title_idf")
+      .setOutputCol("normalized_product_title_idf")
+      .transform(dataFrame)
 
 
-    dataFrame
+    val normalized_search_term_idf_DF = new Normalizer()
+      .setInputCol("search_term_idf")
+      .setOutputCol("normalized_search_term_idf")
+      .transform(normalized_product_title_idf_DF)
+
+
+    val featuresAndSearchFeaturesDF = normalized_search_term_idf_DF
+
+
+    /**Create a vector using Vector Assembler from the two normalized columns and name it Similarity*/
+    val output = new VectorAssembler()
+      .setInputCols(Array("normalized_product_title_idf", "normalized_search_term_idf"))
+      .setOutputCol("title_term_similarity")
+      .transform(featuresAndSearchFeaturesDF).select("title_term_similarity").rdd
+
+    /**In order to calculate the Similarity between two columns we need to create the Matrix
+      * To do that we get the first field of output rdd which contains the Similarity
+      * Afterwards create a RowMatrix with the recently created vector
+      * We can compute similarities either with a Brute force(simsPerfect) approach or
+      * with an approximation(simsEstimate)
+      *
+      */
+    val items_mllib_vector = output.map(_.getAs[org.apache.spark.ml.linalg.Vector](0)).map(org.apache.spark.mllib.linalg.Vectors.fromML)
+    val mat = new RowMatrix(items_mllib_vector)
+    /*Brute force approach*/
+    //val simsPerfect = mat.columnSimilarities()
+
+    /*With approximation*/
+    val simsEstimate = mat.columnSimilarities(0.1) //using DISUM
+
+
+    /**We now prepare the data to create the new dataframe so that we can use it later on the ML Models*/
+    val transformedRDD = simsEstimate.entries.map{case MatrixEntry(row: Long, col:Long, sim:Double) => Array(sim).mkString(",")}
+    //Transform rdd[String] to rdd[Row]
+    val rdd2 = transformedRDD.map(a => Row(a))
+
+    // to DF
+    /**By creating monotonically increasing ids and doing orderby  we ensure that the two dataframes will join properly*/
+    val dfschema = StructType(Array(StructField("title_term_similarity",StringType)))
+    val rddToDF = spark.createDataFrame(rdd2,dfschema).select("title_term_similarity").withColumn("rowID2",monotonically_increasing_id())
+
+    val relevanceDF = featuresAndSearchFeaturesDF//.select("product_uid","relevance")
+      .orderBy("product_uid")
+      .withColumn("rowID1",monotonically_increasing_id())
+
+    val cosineDF = relevanceDF.join(rddToDF,relevanceDF("rowID1")===rddToDF("rowID2"),"left")
+
+    cosineDF
   }
 
-//  def cosineSimilarity(vectorA: SparseVector, vectorB:SparseVector,normASqrt:Double,normBSqrt:Double) :(Double,Double) = {
-//    var dotProduct = 0.0
-//    for (i <-  vectorA.indices){
-//      dotProduct += vectorA(i) * vectorB(i)
-//    }
-//    val div = (normASqrt * normBSqrt)
-//    if( div == 0 )
-//      (dotProduct,0)
-//    else
-//      (dotProduct,dotProduct / div)
-//  }
+  private def jaccard_similarity(spark: SparkSession, dataFrame: DataFrame):DataFrame = {
+    val joinedDF = dataFrame.orderBy("id")
+    val lsh = new MinHashLSH().setInputCol("search_term_tf").setOutputCol("LSH").setNumHashTables(3)
+
+    val pipe = new Pipeline().setStages(Array(lsh))
+    val pipeModel = pipe.fit(joinedDF)
+
+    val transformedDF = pipeModel.transform(joinedDF)
+    val transformer = pipeModel.stages
+
+    /*MinHashModel*/
+    val tempMinHashModel = transformer.last.asInstanceOf[MinHashLSHModel]
+    val threshold = 1.5
+
+    /*Just a udf for converting string to double*/
+    val udf_toDouble = udf( (s: String) => s.toDouble )
 
 
-  private def tf_idf(spark:SparkSession, df:DataFrame):DataFrame = {
-    val tokenizer = new Tokenizer().setInputCol("stemmed_product_description").setOutputCol("product_description_words")
-    val wordsData = tokenizer.transform(df)
+    /*Perform the Similarity with self-join*/
+    /*Find the distance of pairs which is lower than the given threshold*/
 
-    val hashingTF = new HashingTF()
-      .setInputCol("product_description_words").setOutputCol("product_description_tf").setNumFeatures(20)
+    val preSimilarityDF = tempMinHashModel.approxSimilarityJoin(transformedDF,transformedDF,threshold)
+      .select(udf_toDouble(col("datasetA.relevance")).alias("relev"),
+        col("distCol"))
 
-    val featurizedData = hashingTF.transform(wordsData)
+    /*Make a vector of the distCol and name it Similarity. It will be needed when using the df for the ML Models*/
+    val vectorAssem = new VectorAssembler()
+      .setInputCols(Array("distCol"))
+      .setOutputCol("Similarity")
 
-    val idf = new IDF().setInputCol("product_description_tf").setOutputCol("product_description_tfidf")
-    val idfModel = idf.fit(featurizedData)
 
-    val rescaledData = idfModel.transform(featurizedData)
-    val tfidf = rescaledData.select("product_uid", "product_description_tfidf")
-    val with_tfidf = df.join(tfidf, usingColumns = Seq("product_uid"), joinType = "left")
+    val jaccardSimilarityDF = vectorAssem.transform(preSimilarityDF).select("Similarity", "relev").withColumnRenamed("Similarity","jaccard_similarity")
+//    val with_jacSim = joinedDF.join(jaccardSimilarityDF, usingColumns = Seq("product_uid"), joinType = "left")
 
-    with_tfidf
+    jaccardSimilarityDF
+  }
+
+  private def title_tf_idf(spark:SparkSession, df:DataFrame):DataFrame = {
+    val tokenizedDF = tokenize(spark, df, "stemmed_product_title", "product_title_words")
+    val tfDF = tf(spark, tokenizedDF, "product_title_words", "product_title_tf")
+    val idfDF = idf(spark, tfDF, "product_title_tf", "product_title_idf")
+
+    idfDF
+  }
+
+  private def description_tf_idf(spark:SparkSession, df:DataFrame):DataFrame = {
+    val tokenizedDF = tokenize(spark, df, "stemmed_product_description", "product_description_words")
+    val tfDF = tf(spark, tokenizedDF, "product_description_words", "product_description_tf")
+    val idfDF = idf(spark, tfDF, "product_description_tf", "product_description_idf")
+
+    idfDF
+  }
+
+  private def search_term_tf_idf(spark:SparkSession, df:DataFrame):DataFrame = {
+    val tokenizedDF = tokenize(spark, df, "stemmed_search_term", "search_term_words")
+    val tfDF = tf(spark, tokenizedDF, "search_term_words", "search_term_tf")
+    val idfDF = idf(spark, tfDF, "search_term_tf", "search_term_idf")
+
+    idfDF
+  }
+
+  private def tokenize(sparkSession: SparkSession, dataFrame: DataFrame, inputCol: String, outputCol: String):DataFrame = {
+    val tokenizer = new Tokenizer().setInputCol(inputCol).setOutputCol(outputCol)
+    tokenizer.transform(dataFrame)
+  }
+
+  private def tf(sparkSession: SparkSession, dataFrame: DataFrame, inputCol: String, outputCol: String): DataFrame = {
+    val hashingTF = new HashingTF().setInputCol(inputCol).setOutputCol(outputCol).setNumFeatures(20000)
+    hashingTF.transform(dataFrame)
+  }
+
+  private def idf(sparkSession: SparkSession, dataFrame: DataFrame, inputCol: String, outputCol: String):DataFrame = {
+    val idf = new IDF().setInputCol(inputCol).setOutputCol(outputCol)
+    val idfModel = idf.fit(dataFrame)
+    idfModel.transform(dataFrame)
   }
 
   private def levenshtein_distance(dataFrame: DataFrame, left:Column, right:Column, newColumnName: String):DataFrame = {
