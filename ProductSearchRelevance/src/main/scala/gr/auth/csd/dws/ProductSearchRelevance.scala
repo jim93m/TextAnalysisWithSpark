@@ -107,6 +107,7 @@ object ProductSearchRelevance {
     val lrPredictions = lrModel.transform(test)
 
     // Descritize predictions to certain levels
+    // Not currently used, as it did not offer better results
     val roundToLevels = udf((pred: Double) => {
       val levels: List[Double] = List(1.0, 1.33, 1.67, 1.75, 2.0, 2.25, 2.33, 2.5, 2.67, 2.75, 3.0)
       var minimum: Double = 2.0
@@ -155,7 +156,7 @@ object ProductSearchRelevance {
     // Descritize predictions into two levels
     val roundTo2Levels = udf((label: Double) => {
       var binary: Double = 0.0
-      if (label > 2.7) {
+      if (label > 1.5) {
         binary = 1.0
       }
       else {
